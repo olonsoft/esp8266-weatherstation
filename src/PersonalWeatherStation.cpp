@@ -846,13 +846,3 @@ void loop()
 
   yield();
 }
-
-/* todo: check this out: 
-https://github.com/fractalxaos/weather/blob/master/Arduino/WeatherStation.ino
-https://github.com/rpurser47/weatherstation/blob/master/weatherstation.ino
-https://github.com/sparkfun/Wimp_Weather_Station/blob/master/Wimp_Weather_Station.ino
-https://github.com/PaulRB/Wemos-Weather-Station
-http://mile-end.co.uk/blog/?p=86
-http://www.iwmi.cgiar.org/tools/mobile-weather-stations/Mobile%20Weather%20Stations%20-%20Manual.pdf
-https://www.hackster.io/hliang/thingspeak-weather-station-data-analysis-2877b0
-*/
