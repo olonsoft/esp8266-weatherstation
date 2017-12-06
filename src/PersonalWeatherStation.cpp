@@ -7,586 +7,585 @@
 #include <WiFiClientSecure.h>
 #include <ESP8266HTTPClient.h>
 #include <ESP8266httpUpdate.h>
-#include <TimeLib.h>
-#include <WiFiUdp.h>
-#include <Ticker.h>
+#include <limits.h>
+
+#include <NTPClient.h> // https://github.com/arduino-libraries/NTPClient
+#include <TimeLib.h>   // https://github.com/PaulStoffregen/Time
+#include <WiFiUdp.h>   // needed for ntp time
+
 #include "Accounts.h"
+#include "helper.h" // some helper classes
 
-#include <SPI.h>                  // this is needed for BME280 library
-#include <BME280I2C.h>            // by Tyler Glenn https://github.com/finitespace/BME280
-#include <Wire.h>                 // Needed for legacy versions of Arduino.
+#include <SPI.h>                     // this is needed for BME280 library
+#include <EnvironmentCalculations.h> // for dewPoint calculation
+#include <BME280I2C.h>               // by Tyler Glenn https://github.com/finitespace/BME280
+#include <Wire.h>                    // Needed for legacy versions of Arduino.
 
-#define UPDATE_CHECK_INTERVAL 300 // FOTA update interval
+#define UPDATE_CHECK_INTERVAL 60 // FOTA update interval in seconds
 #define AVERAGE_GUST_INTERVAL 3   // calc average gust every 3 seconds and uses the max of these measurements. https://www.wmo-sat.info/oscar/variables/view/205
 #define REPORT_DATA_INTERVAL 600  // report every X seconds
-#define REPORT_TIMES_PER_HOUR 6   //
-#define CUP_CIRCUMFERENCE 1       // in meters. Experiment with this value (0.67 * 1.5)
-#define READ_DIR_INTERVAL 1       // read wind direction sensor every 1 sec to calc average
+//    #define REPORT_TIMES_PER_HOUR 6   //
+//    #define CUP_CIRCUMFERENCE 1       // in meters. Experiment with this value (0.67 * 1.5)
+//    #define READ_DIR_INTERVAL 1       // read wind direction sensor every 1 sec to calc average
 #define CLOCK_SYNC_INTERVAL 3600  // update clock every X seconds
-#define USE_SERIAL Serial
-#define DEBOUNCE_DELAY 10         // 10 ms
 
-String projectName = "anemometer";
-String currentVersion = "1.0.23";
+String projectName = "Weather Station";
+String currentVersion = "1.1.10";
 #define SENDTOSITE // if commented, will not post to sites.
+
+bool sleeping = false;
 
 const int httpsPort = 443;
 const int httpPort = 80;
 
 //thingspeak
-const char* postSite1 = "api.thingspeak.com";
-String postData1 = "/update?key=%ThingspeakKey&field1=%temp&field2=%hum&field3=%pres&field4=%dew&field5=%heatIdx&field6=%wSpeed&field7=%wGust&field8=%wDir";
-const char* ThingspeakSHA1 = "78:60:18:44:81:35:BF:DF:77:84:D4:0A:22:0D:9B:4E:6C:DC:57:2C";
+const char *postSite1 = "api.thingspeak.com";
+String postData1 = "/update?key=%ThingspeakKey&field1=%temp&field2=%hum&field3=%pres&field4=%cRain&field5=%heatIdx&field6=%wSpeed&field7=%wGust&field8=%wDir";
+const char *ThingspeakSHA1 = "78:60:18:44:81:35:BF:DF:77:84:D4:0A:22:0D:9B:4E:6C:DC:57:2C";
 
 // weatherundergound
-const char* postSite2 = "weatherstation.wunderground.com";
-String postData2 = "/weatherstation/updateweatherstation.php?ID=%WUndergroundID&PASSWORD=%WUndergroundPSW&dateutc=now&winddir=%wDir&windspeedmph=%wSpeed&windgustmph=%wGust&tempf=%temp&baromin=%pres&dewptf=%dew&humidity=%hum&rainin=%hRain&softwaretype=esp8266&action=updateraw";
-const char* WUndergroundSHA1 = "12:DB:BB:24:8E:0F:6F:D4:63:EC:45:DD:5B:ED:37:D7:6F:B1:5F:E5";
+const char *postSite2 = "weatherstation.wunderground.com";
+String postData2 = "/weatherstation/updateweatherstation.php?ID=%WUndergroundID&PASSWORD=%WUndergroundPSW&dateutc=now&winddir=%wDir&windspeedmph=%wSpeed&windgustmph=%wGust&tempf=%temp&baromin=%pres&dewptf=%dew&humidity=%hum&rainin=%cRain&softwaretype=esp8266&action=updateraw";
+const char *WUndergroundSHA1 = "12:DB:BB:24:8E:0F:6F:D4:63:EC:45:DD:5B:ED:37:D7:6F:B1:5F:E5";
 
 //PWSweather.com
-const char* postSite3 = "www.pwsweather.com";
-String postData3 = "/pwsupdate/pwsupdate.php?ID=%PWSweatherID&PASSWORD=%PWSweatherPSW&dateutc=%now&winddir=%wDir&windspeedmph=%wSpeed&windgustmph=%wGust&tempf=%temp&baromin=%pres&dewptf=%dew&humidity=%hum&rainin=%hRain&softwaretype=esp8266&action=updateraw";
-const char* PWSweatherSHA1 = "74:3C:4F:DD:3E:8E:51:40:B4:28:79:7D:6A:B4:30:FE:4A:56:10:BE";
+const char *postSite3 = "www.pwsweather.com";
+String postData3 = "/pwsupdate/pwsupdate.php?ID=%PWSweatherID&PASSWORD=%PWSweatherPSW&dateutc=%now&winddir=%wDir&windspeedmph=%wSpeed&windgustmph=%wGust&tempf=%temp&baromin=%pres&dewptf=%dew&humidity=%hum&rainin=%cRain&softwaretype=esp8266&action=updateraw";
+const char *PWSweatherSHA1 = "74:3C:4F:DD:3E:8E:51:40:B4:28:79:7D:6A:B4:30:FE:4A:56:10:BE";
 
-const char* postSite4 = "www.studio19.gr";
-String postData4 = "/weather/post.php?id=%MySiteID&psw=%MySitePSW&temp=%temp&hum=%hum&pressure=%pres&heatindex=%heatIdx&dewpoint=%dew&windspeed=%wSpeed&windgust=%wGust&winddir=%wDir&windchill=%wChill&rain=%hRain&dayrain=%dRain";
-//const char* postSite4 = "139.91.162.84";
+const char *postSite4 = "www.studio19.gr"; // my private site
+String postData4 = "/weather/post.php?id=%MySiteID&psw=%MySitePSW&temp=%temp&hum=%hum&pressure=%pres&heatindex=%heatIdx&dewpoint=%dew&windspeed=%wSpeed&windgust=%wGust&winddir=%wDir&windchill=%wChill&rain=%cRain&dayrain=%dRain";
+//const char* postSite4 = "xxx.xxx.xxx.xxx";
 // String postData4 = "/html/ws/post.php?id=%MySiteID&psw=%MySitePSW&temp=%temp&hum=%hum&pressure=%pres&heatindex=%heatIdx&dewpoint=%dew&windspeed=%wSpeed&windgust=%wGust&winddir=%wDir&windchill=%wChill&rain=%hRain&dayrain=%dRain";
 
+// ===================================================================
+// 						NTP
+// ===================================================================
+const int timeZone = 0; // Central European Time (UTC = 0)
+WiFiUDP ntpUDP;
+// You can specify the time server pool and the offset (in seconds, can be
+// changed later with setTimeOffset() ). Additionaly you can specify the
+// update interval (in milliseconds, can be changed using setUpdateInterval() ).
+NTPClient timeClient(ntpUDP, "europe.pool.ntp.org", 0, CLOCK_SYNC_INTERVAL * 1000);
 
-// variables for ntp time
-static const char ntpServerName[] = "pool.ntp.org";
-const int timeZone = 0;     // Central European Time (UTC = 0)
-WiFiUDP Udp;
-unsigned int localPort = 8888;  // local port to listen for UDP packets
-time_t getNtpTime();
-void sendNTPpacket(IPAddress &address);
+// ====================================================================
 
-Ticker tickerUpdateCheck;
-Ticker tickerGustTimer;
-Ticker tickerReadDirection;
-Ticker tickerClockSync;
-Ticker tickerReportData;
+uint32_t nextFOTACheckTime = 0;
+uint32_t nextReportTime = 30000; // 30 secs after boot, send first data
+uint32_t nextWindVaneTime = 0;
+uint32_t nextWindGustTime = 3000;
 
-bool doUpdateCheck = true;
-bool doReadDirection = true;
-bool doClockSync = true;
-bool doCalcGustAverage = false;
-bool doReportData = false;
+BME280I2C bme; // Default : forced mode, standby time = 1000 ms
+               // Oversampling = pressure ×1, temperature ×1, humidity ×1, filter off,
+bool BMESensorFound = false;
 
-BME280I2C bme;                // Default : forced mode, standby time = 1000 ms
-                              // Oversampling = pressure ×1, temperature ×1, humidity ×1, filter off,
-bool metric = true;
-float temp(NAN), hum(NAN), pres(NAN);
-uint8_t pressureUnit(1);    // unit: B000 = Pa, B001 = hPa, B010 = Hg, B011 = atm, B100 = bar, B101 = torr, B110 = N/m^2, B111 = psi
-
-// wind variables
-#define PIN_WINDSPEED 14
-#define PIN_RAINPIN 12
 #define PIN_CLEAR 13
 
-float windSpeed = 0.0f;
-float tmpWindSpeed = 0.0f;
-volatile unsigned int windSpeedSamplesCount = 0;
+// ================ global variables ==================
+bool metric = true;
+float temp(NAN), hum(NAN), pres(NAN);
+float dewPoint = 0.0f;;
+float heatIndex = 0.0f;;
+float windSpeed = 0.0f;;
+float windGust = 0.0f;;
+float windPeak = 0.0f;;
+float windChill = 0.0f;
+float windDir = 0.0f;;
+float rainCurrent = 0.0f;;
+float rainHour = 0.0f;;
+float rainDay = 0.0f;;
 
-float windGust = 0.0f;
-float tmpWindGust = 0.0f;
-volatile unsigned int windGustSamplesCount = 0;
+//===========================================================================
+// 					Rain Gauge
+//===========================================================================
 
-float windPeak = 0.0f;
-unsigned long windSpeedLastIntTime = 0;
-unsigned long windSpeedStartSampleTime = 0;
-unsigned int periodsCount = 0;
+uint8_t RainPin = 12;
+volatile uint16_t rainEventCount;
+uint32_t lastRainEvent;
+float RainScaleInches = 0.011f; // Each pulse is .011 inches of rain (or 0.2794 mm)
 
-int windDir = 0;
-float dewPoint = NAN;
-float heatIndex = NAN;
-float windChill = NAN;
+void handleRainEvent()
+{
+  // Count rain gauge bucket tips as they occur
+  // Activated by the magnet and reed switch in the rain gauge, attached to input D2
+  uint32_t timeRainEvent = millis(); // grab current time
 
-volatile int currentRainCount = 0;
-float currentRain = 0.0f;
-int hourRainCount = 0;
-int hourRainArray[60] = {};
-float hourRain = 0.0f;
-int dayRainCount = 0;
-int dayRainArray[24] = {};
-float dayRain = 0.0f;
+  // ignore switch-bounce glitches less than 10mS after initial edge
+  if (timeRainEvent - lastRainEvent < 10)
+  {
+    return;
+  }
 
-unsigned long rainLastIntTime = 0 ;
-unsigned long count1h = 0;
-unsigned long count1d = 0;
-
-
-void enableUpdateCheck() {
-  doUpdateCheck = true;
+  rainEventCount++;              //Increase this minute's amount of rain
+  lastRainEvent = timeRainEvent; // set up for next event
 }
 
-void enableReadDirection(){
-  doReadDirection = true;
+void initializeRainGauge()
+{
+  pinMode(RainPin, INPUT);
+  rainEventCount = 0;
+  lastRainEvent = 0;
+  attachInterrupt(RainPin, handleRainEvent, FALLING);
 }
 
-void enableClockSync() {
-  doClockSync = true;
+float getAndResetRainInches()
+{
+  float result = RainScaleInches * float(rainEventCount);
+  rainEventCount = 0;
+  return result;
 }
 
-void enableCalcGustAverage() {
-  doCalcGustAverage = true;
+//===========================================================================
+//                      Wind Speed (Anemometer)
+//===========================================================================
+
+// The Anemometer generates a frequency relative to the windspeed.  1Hz: 1.492MPH, 2Hz: 2.984MPH, etc.
+// We measure the average period (elaspsed time between pulses), and calculate the average windspeed since the last recording.
+
+uint8_t AnemometerPin = 14;
+float AnemometerScaleMPH = 1.492f; // Windspeed if we got a pulse every second (i.e. 1Hz)
+volatile uint32_t WindSpeedPeriodTotal = 0;
+volatile uint16_t WindSpeedPeriodSamples = 0;
+volatile uint32_t GustPeriod = UINT_MAX;
+uint16_t GustAvgSamples = 0;
+uint16_t GustAvgTotal = 0;
+uint16_t GustTotalSamples = 0;
+uint32_t GustTotal = 0;
+uint32_t lastAnemoneterEvent = 0;
+
+void handleAnemometerEvent()
+{
+  // Activated by the magnet in the anemometer (2 ticks per rotation)
+  uint32_t currentMillis = millis(); // grab current time
+  //If there's never been an event before (first time through), then just capture it
+  if (lastAnemoneterEvent != 0)
+  {
+    // Calculate time since last event
+    // todo: check overflow here
+    uint32_t period = currentMillis - lastAnemoneterEvent;
+    // ignore switch-bounce glitches less than 10mS after initial edge (which implies a max windspeed of 149mph)
+    if (period > 10)
+    {
+      WindSpeedPeriodTotal += period;
+      WindSpeedPeriodSamples++;
+      // continuosly calc gust
+      float tmpWindSpeed = AnemometerScaleMPH * 1000 / float(period);
+      if (tmpWindSpeed > windPeak) windPeak = tmpWindSpeed;
+      GustAvgSamples++;
+      GustAvgTotal += tmpWindSpeed;
+    }
+  }
+  lastAnemoneterEvent = currentMillis; // set up for next event
 }
 
-void enableReportData() {
-  doReportData = true;
+void initializeAnemometer()
+{
+  pinMode(AnemometerPin, INPUT);
+  WindSpeedPeriodTotal = 0;
+  WindSpeedPeriodSamples = 0;
+  GustPeriod = UINT_MAX; //  The shortest period (and therefore fastest gust) observed
+  GustTotal = 0;
+  lastAnemoneterEvent = 0;
+  attachInterrupt(AnemometerPin, handleAnemometerEvent, FALLING);
 }
 
-float convertCtoF(float c) {
-  return c * 1.8f + 32;
+float getAndResetAnemometerMPH()
+{
+  if (WindSpeedPeriodSamples == 0)
+  {
+    return 0;
+  }
+  // Nonintuitive math:  We've collected the sum of the observed periods between pulses, and the number of observations.
+  // Now, we calculate the average period (sum / number of readings), take the inverse and muliple by 1000 to give frequency, and then mulitply by our scale to get MPH.
+  // The math below is transformed to maximize accuracy by doing all muliplications BEFORE dividing.
+  float result = AnemometerScaleMPH * 1000.0 * float(WindSpeedPeriodSamples) / float(WindSpeedPeriodTotal);
+  WindSpeedPeriodTotal = 0;
+  WindSpeedPeriodSamples = 0;  
+  return result;
 }
 
-float convertFtoC(float f) {
-  return (f - 32) * 0.55555f;
+float getAndResetWindGust()  // we call this every 3 secs in main loop
+{
+  float result = 0.0f;
+  if (GustAvgSamples > 0)
+    result = GustAvgTotal / GustAvgSamples;
+  GustAvgTotal = 0.0f;
+  GustAvgSamples = 0;  
+  GustPeriod = UINT_MAX; // not needed
+  return result;
 }
 
-void restartIfNotConnected() {
-  if (!WiFi.isConnected()) {
-    USE_SERIAL.println("Not Connected to WiFi. Rebooting...");
+//===========================================================
+// 										Wind Vane
+//===========================================================
+
+void initializeWindVane()
+{
+  return;
+}
+
+// For the wind vane, we need to average the unit vector components (the sine and cosine of the angle)
+uint8_t WindVanePin = A0;
+float windVaneCosTotal = 0.0;
+float windVaneSinTotal = 0.0;
+uint16_t windVaneReadingCount = 0;
+const float DEG2RAD = M_PI / 180.0; // convert degrees to radian
+
+int voltage2degrees(uint16_t v)
+{
+  if (v > 1022) return 270;      // W            920
+  else if (v > 1000) return 315; // NW           850
+  else if (v > 913) return 0;   // N            780
+  else if (v > 775) return 225; // SW           630
+  else if (v > 606) return 45;  // NE           500
+  else if (v > 398) return 180; // S            300
+  else if (v > 265)  return 135; // SE          200
+  else if (v > 140)  return 90;  // E            90
+  else return 0;  
+}
+
+void captureWindVane()
+{
+  float windVaneRadians = voltage2degrees(analogRead(WindVanePin)) * DEG2RAD;
+  if (windVaneRadians >= 0 && windVaneRadians <= 6.28318531f)  // 0 to 359.9999999 degrees
+  {
+    windVaneCosTotal += cos(windVaneRadians);
+    windVaneSinTotal += sin(windVaneRadians);
+    windVaneReadingCount++;
+  }
+}
+
+float getAndResetWindVaneDegrees()
+{
+	if (windVaneReadingCount == 0) {
+		return 0;
+	}
+	float avgCos = windVaneCosTotal/float(windVaneReadingCount);
+	float avgSin = windVaneSinTotal/float(windVaneReadingCount);
+	float result = atan(avgSin/avgCos) * 180.0f / 3.14159f;
+	windVaneCosTotal = 0.0;
+	windVaneSinTotal = 0.0;
+	windVaneReadingCount = 0;
+	// atan can only tell where the angle is within 180 degrees.  Need to look at cos to tell which half of circle we're in
+	if(avgCos < 0) result += 180.0;
+	// atan will return negative angles in the NW quadrant -- push those into positive space.
+	if(result < 0) result += 360.0;
+    
+   return roundf(result * 100) / 100;
+}
+
+// ========================================================
+// 					BME Sensor
+// ========================================================
+
+void initializeBMESensor()
+{
+  Serial.print(F("Checking for BME280 Sensor... "));
+  Wire.begin(); // for BME280. Parameters are pinSDA, pinSCL Defaults are 4,5
+  // try to initialize BME280 sensor
+  BMESensorFound = bme.begin();
+
+  if (BMESensorFound)
+  {
+    Serial.println(F("Found!"));
+  }
+  else
+  {
+    Serial.println(F("Not found!"));
+  }
+  delay(1000);
+}
+
+bool WiFi_Connected()
+{
+  bool b = false;
+  b = ((WL_CONNECTED == WiFi.status()) && (static_cast<uint32_t>(WiFi.localIP()) != 0));
+  if (b)
+  {
+    Serial.print("WiFi is connected with IP: ");
+    Serial.print(WiFi.localIP());
+    Serial.print(" MAC: ");
+    Serial.println(WiFi.BSSIDstr());
+  }
+  return b;
+}
+
+void restartIfNotConnected()
+{
+  if (!WiFi_Connected())
+  {
+    Serial.println("Not Connected to WiFi. Rebooting...");
     //reset and try again,
     ESP.restart();
     delay(1000);
-    }
+  }
 }
 // check http://stackoverflow.com/questions/41371156/esp8266-and-post-request
 
-void send2site(const char* host, String data) {
+void send2site(const char *host, String data)
+{
 
   WiFiClient client;
-  USE_SERIAL.print("connecting to ");
-  USE_SERIAL.println(host);
-  if (!client.connect(host, httpPort)) {
-    USE_SERIAL.println("connection failed");
+  Serial.print("connecting to ");
+  Serial.println(host);
+  if (!client.connect(host, httpPort))
+  {
+    Serial.println("connection failed");
     return;
   }
 
-  USE_SERIAL.print("requesting URL: ");
-  USE_SERIAL.println(data);
+  Serial.print("requesting URL: ");
+  Serial.println(data);
 
   client.print(String("GET ") + data + " HTTP/1.1\r\n" +
                "Host: " + host + "\r\n" +
                "User-Agent: ESP8266\r\n" +
                "Connection: close\r\n\r\n");
 
-  USE_SERIAL.println("request sent");
+  Serial.println("request sent");
 
-	delay(10);
-
-	while (client.connected()) {
-    String line = client.readStringUntil('\n');
-		line += ("\r\n");
-		USE_SERIAL.print(line);
+  // give host 5 seconds to reply
+  unsigned long timeout = millis();
+  while (client.available() == 0)
+  {
+    if (millis() - timeout > 5000)
+    {
+      Serial.println(">>> Client Timeout !");
+      client.stop();
+      return;
+    }
   }
-  USE_SERIAL.println("closing connection");
+
+  while (client.connected())
+  {
+    String line = client.readStringUntil('\n');
+    line += ("\r\n");
+    Serial.print(line);
+  }
+  Serial.println("closing connection");
 }
 
-void send2siteSecure(const char* host, const char* fingerprint, String data) {
+void send2siteSecure(const char *host, const char *fingerprint, String data)
+{
 
-// Use WiFiClientSecure class to create TLS connection
+  // Use WiFiClientSecure class to create TLS connection
   WiFiClientSecure client;
-  USE_SERIAL.print("connecting to ");
-  USE_SERIAL.println(host);
-  if (!client.connect(host, httpsPort)) {
-    USE_SERIAL.println("connection failed");
+  Serial.print("connecting to ");
+  Serial.println(host);
+  if (!client.connect(host, httpsPort))
+  {
+    Serial.println("connection failed");
     return;
   }
 
-  if (client.verify(fingerprint, host)) {
-    USE_SERIAL.println("certificate matches");
-  } else {
-    USE_SERIAL.println("certificate doesn't match");
+  if (client.verify(fingerprint, host))
+  {
+    Serial.println("certificate matches");
+  }
+  else
+  {
+    Serial.println("certificate doesn't match");
   }
 
-  USE_SERIAL.print("requesting URL: ");
-  USE_SERIAL.println(data);
+  Serial.print("requesting URL: ");
+  Serial.println(data);
 
   client.print(String("GET ") + data + " HTTP/1.1\r\n" +
                "Host: " + host + "\r\n" +
                "User-Agent: ESP8266\r\n" +
                "Connection: close\r\n\r\n");
 
-  USE_SERIAL.println("request sent");
+  Serial.println("request sent");
 
-	delay(10);
+  // give host 5 seconds to reply
+  unsigned long timeout = millis();
+  while (client.available() == 0)
+  {
+    if (millis() - timeout > 5000)
+    {
+      Serial.println(">>> Client Timeout !");
+      client.stop();
+      return;
+    }
+  }
 
-	while (client.connected()) {
+  while (client.connected())
+  {
     String line = client.readStringUntil('\n');
-		line += ("\r\n");
-		USE_SERIAL.print(line);
+    line += ("\r\n");
+    Serial.print(line);
   }
-  USE_SERIAL.println("closing connection");
+  Serial.println("closing connection");
 }
 
-/*
-void send2site(String site, String fingerprint, String data) {
-  if (WiFi.isConnected()) {
-	  HTTPClient http;
-	  http.begin(site, fingerprint);
-	  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-	  int httpCode = http.POST(data);
-	  // httpCode will be negative on error
-	  if (httpCode > 0) {
-		// HTTP header has been send and Server response header has been handled
-		USE_SERIAL.printf("[HTTP] POST/GET code: %d\n", httpCode);
 
-		// file found at server
-		if (httpCode == HTTP_CODE_OK) {
-		  String payload = http.getString();
-		  USE_SERIAL.println(payload);
-		}
-	  } else {
-		USE_SERIAL.printf("[HTTP] POST/GET... failed, error: %s\n", http.errorToString(httpCode).c_str());
-	  }
-	  http.writeToStream(&Serial);
-	  http.end();
-  }
-}
-*/
-
-void windSpeedPinInterrupt() {
-  if (windSpeedLastIntTime == 0){
-    windSpeedLastIntTime = windSpeedStartSampleTime = millis();
-    return;
-  }
-  unsigned long _timeSpan = millis() - windSpeedLastIntTime;
-  windSpeedLastIntTime = millis();
-  //Serial.println(thisTime);
-  if (_timeSpan > DEBOUNCE_DELAY) { //debouncing
-
-    windSpeedSamplesCount++;
-    windGustSamplesCount++;
-
-    float _speed = (CUP_CIRCUMFERENCE / 1000.0f) / (_timeSpan / 3600000.0f);
-    //Serial.print("<>Speed: "); Serial.println(_speed);
-    tmpWindSpeed += _speed;
-    tmpWindGust += _speed;
-
-    if (windPeak < _speed) windPeak = _speed;
-  } else Serial.println("Debounce ");
+void enableInterrupts()
+{
+  attachInterrupt(AnemometerPin, handleAnemometerEvent, FALLING);
+  attachInterrupt(RainPin, handleRainEvent, FALLING);
 }
 
-void rainPinInterrupt() {
-  unsigned long thisTime =  micros() - rainLastIntTime;
-  rainLastIntTime = micros();
-  //Serial.println(thisTime);
-  if (thisTime > 1000) { //debouncing
-    currentRainCount++;
-  }
+void disableInterrupts()
+{
+  detachInterrupt(AnemometerPin);
+  detachInterrupt(RainPin);
 }
 
-float totalRain(float rainValue) {
-  static float rainValues[REPORT_TIMES_PER_HOUR] = {};
-  float total = 0;
-  for (int i = 0; i < REPORT_TIMES_PER_HOUR-1; i++) {
-    rainValues[i] = rainValues[i+1];
-    total += rainValues[i];
-  }
-  rainValues[REPORT_TIMES_PER_HOUR-1]=rainValue;
-  total += rainValue;
-  return total;
-}
-
-void enableInterrupts() {
-  attachInterrupt(PIN_WINDSPEED, windSpeedPinInterrupt, FALLING);
-  attachInterrupt(PIN_RAINPIN, rainPinInterrupt, FALLING);
-}
-
-void disableInterrupts() {
-  detachInterrupt(PIN_WINDSPEED);
-  detachInterrupt(PIN_RAINPIN);
-}
-
-bool wakeUp() {
-  USE_SERIAL.print("Waking Up: ");
-  if (!WiFi.isConnected()) {
-    //disableInterrupts();
+bool wakeUpNow()
+{
+  if (sleeping) {
+    Serial.print("Waking Up: ");
     WiFi.forceSleepWake();
-    int i = 0;
-    while (!WiFi.isConnected() & (i++ < 20)) {
-      USE_SERIAL.print("w");
+    delay(1);
+    uint8_t i = 0;
+    while (!WiFi_Connected() & (i++ < 20))
+    {
+      Serial.print("w");
       delay(1000);
     }
   }
-  //enableInterrupts();
-  USE_SERIAL.println();
-  return WiFi.isConnected();
+  sleeping = !WiFi_Connected();
+  Serial.println();
+  return sleeping;
 }
 
-bool updateCheck() {
+bool sleepNow()
+{
+  // ==================== turn off wifi to save battery  =====================
+  Serial.print(F("Entering wifi sleep... "));
+//  WiFi.disconnect();
+//  delay(1);
+//  WiFi.mode( WIFI_OFF );
+//  delay(1);
+  
+  bool b = WiFi.forceSleepBegin();
+  delay(1);
+  Serial.print("Result: "); Serial.print(b);  
+  Serial.println("ok!");
+  sleeping = true;
+}
+
+bool updateCheck()
+{
+
   bool updateFlag = false;
   String latestVersion = "";
-  if (WiFi.isConnected()) {
-	  USE_SERIAL.println("Update: Checking for new firmware. Current version: " + currentVersion);
+  String LogStr = "FOTA: ";
+  if (WiFi_Connected())
+  {
+    Serial.println(LogStr + "Checking for new firmware. Current version: " + currentVersion);
     HTTPClient upd;
-    USE_SERIAL.println("Update: Connecting to update site: " + updateSite );
+    Serial.println(LogStr + "Connecting to update site: " + updateSite);
     // configure traged server and url
-    String file2Load = updateSite + projectName + ".txt";
-    USE_SERIAL.println("Update: File to load: " + file2Load);
+    String file2Load = updateSite + "version.txt";
+    Serial.println(LogStr + "File to load: " + file2Load);
     upd.begin(file2Load); //HTTP
     // start connection and send HTTP header
     int httpCode = upd.GET();
 
     // httpCode will be negative on error
-    if (httpCode > 0) {
+    if (httpCode > 0)
+    {
       // HTTP header has been send and Server response header has been handled
-      USE_SERIAL.printf("Update: [HTTP] GET result code: %d\n", httpCode);
+      Serial.println(LogStr + "[HTTP] GET result code: " + httpCode);
 
       // file found at server
-      if (httpCode == HTTP_CODE_OK) {
+      if (httpCode == HTTP_CODE_OK)
+      {
         latestVersion = upd.getString();
-        USE_SERIAL.println("Update: Found version No: <" + latestVersion + ">");
-        if (latestVersion != currentVersion) {
-          USE_SERIAL.println("Update: Modified version found");
+        Serial.println(LogStr + "Found version No: <" + latestVersion + ">");
+        if (latestVersion != currentVersion)
+        {
+          Serial.println(LogStr + "Modified version found");
           updateFlag = true;
-        } else USE_SERIAL.println("Update: No new version found");
+        }
+        else
+          Serial.println(LogStr + "No new version found");
       }
-    } else {
-      USE_SERIAL.printf("Update: [HTTP] GET... failed, error: %s\n", upd.errorToString(httpCode).c_str());
+    }
+    else
+    {
+      Serial.println(LogStr + "[HTTP] GET... failed, error: " + httpCode);
     }
 
     upd.end();
   }
 
-  if (updateFlag) {
+  if (updateFlag)
+  {
     updateFlag = false;
-    USE_SERIAL.println("Update: Trying to update version <" + currentVersion + "> to version: <" + latestVersion + ">");
+    Serial.println(LogStr + "Trying to update version <" + currentVersion + "> to version: <" + latestVersion + ">");
     delay(1000);
-    t_httpUpdate_return ret = ESPhttpUpdate.update(updateSite + projectName + ".bin");
+    t_httpUpdate_return ret = ESPhttpUpdate.update(updateSite + latestVersion + ".bin");
 
-    switch(ret) {
-        case HTTP_UPDATE_FAILED:
-            USE_SERIAL.printf("Update: HTTP_UPDATE_FAILED Error (%d): %s", ESPhttpUpdate.getLastError(), ESPhttpUpdate.getLastErrorString().c_str());
-            break;
+    switch (ret)
+    {
+    case HTTP_UPDATE_FAILED:
+      Serial.print(LogStr);
+      Serial.printf("HTTP_UPDATE_FAILED Error (%d): %s", ESPhttpUpdate.getLastError(), ESPhttpUpdate.getLastErrorString().c_str());
+      break;
 
-        case HTTP_UPDATE_NO_UPDATES:
-            USE_SERIAL.println("Update: HTTP_UPDATE_NO_UPDATES");
-            break;
+    case HTTP_UPDATE_NO_UPDATES:
+      Serial.println(LogStr + "HTTP_UPDATE_NO_UPDATES");
+      break;
 
-        case HTTP_UPDATE_OK:
-            USE_SERIAL.println("Update: HTTP_UPDATE_OK");
-            updateFlag = true;
-            break;
+    case HTTP_UPDATE_OK:
+      Serial.println(LogStr + "HTTP_UPDATE_OK");
+      updateFlag = true;
+      break;
     }
   }
   return updateFlag;
 }
 
-int voltage2degrees(int v)
+String TwoDigitNumber(int n)
 {
-  // following values are working with esp8266
-  if (v > 920) return 270;  // W
-  if (v > 850) return 315;  // NW
-  if (v > 780) return 0;    // N
-  if (v > 630) return 225;  // SW
-  if (v > 500) return 45;   // NE
-  if (v > 300) return 180;  // S
-  if (v > 200)  return 135; // SE
-  if (v > 90)  return 90;   // E
-  return 0;
-}
-
-int avgWindDir(int windDirection)
-{
-  const int ARYSIZE = 10;     // number of elements in arrays
-  const double DEG2RAD = M_PI / 180.0; // convert degrees to radian
-  static double dirNorthSouth[ARYSIZE];
-  static double dirEastWest[ARYSIZE];
-  static int c = 0; // array counter
-
-  if ( c == ARYSIZE )
-  { c = 0; }
-
-  windDirection = windDirection + 1; // convert range from 0-359 to 1 to 360
-
-  dirNorthSouth[c] = cos(windDirection * DEG2RAD);
-  dirEastWest[c++] = sin(windDirection * DEG2RAD);
-
-  // Get array totals
-  double sumNorthSouth = 0.0;
-  double sumEastWest =   0.0;
-  int i;
-  for (i = 0; i < ARYSIZE; i++)
-  {
-    sumNorthSouth += dirNorthSouth[i];
-    sumEastWest   += dirEastWest[i];
-  }
-  sumEastWest = (sumEastWest/(double) ARYSIZE);
-  sumNorthSouth = (sumNorthSouth/(double) ARYSIZE);
-  // use atan2() with average vector
-  double avgWindDir;
-  avgWindDir = atan2(sumEastWest, sumNorthSouth);
-  avgWindDir = avgWindDir / DEG2RAD;  // convert radians back to degrees
-
-  if ( avgWindDir < 0 )
-  { avgWindDir += 360; }
-
-  int avgWindDirection = (int)avgWindDir % 360; // atan2() result can be > 360, so use modulus to just return remainder
-  if (avgWindDirection > 0) {                   // just in case it's 0
-    avgWindDirection = avgWindDirection - 1;    // convert range back to 0-359
-  }
-  return avgWindDirection;
-}
-
-float windChillFactor(float _temperature, float _windspeed, bool isCelcius){
-  float _windChill = NAN;
-  if (!isnan(_temperature)) {
-    if (isCelcius) {
-      if ( (_temperature <= 10.0f) && (_windspeed > 4.8f) ) {    //celcius & km/h
-        _windChill = 13.12f + 0.6215f * _temperature -
-                     11.37f * pow(_windspeed, 0.16f) +
-                    0.3965f * _temperature * pow(_windspeed, 0.16f);
-      }
-    }
-    else if ((_temperature <= 50.0f) && (_windspeed > 3.0f)) {     // fahrenheit & miles/h
-      _windChill = 35.74f + 0.6215f * _temperature -
-                   35.75f * pow(_windspeed, 0.16f) +
-                  0.4275f * _temperature * pow(_windspeed, 0.16f);
-    }
-  }
-  return _windChill;
-}
-
-float calculateHeatIndex(float temperature, float percentHumidity, bool isCelcius) {
-  // Using both Rothfusz and Steadman's equations
-  // http://www.wpc.ncep.noaa.gov/html/heatindex_equation.shtml
-  if (isnan(temperature) || isnan(percentHumidity)) return NAN;
-  float hi;
-
-  if (isCelcius)
-    temperature = convertCtoF(temperature);
-
-  hi = 0.5 * (temperature + 61.0 + ((temperature - 68.0) * 1.2) + (percentHumidity * 0.094));
-
-  if (hi > 79) {
-    hi = -42.379 +
-             2.04901523 * temperature +
-            10.14333127 * percentHumidity +
-            -0.22475541 * temperature*percentHumidity +
-            -0.00683783 * pow(temperature, 2) +
-            -0.05481717 * pow(percentHumidity, 2) +
-             0.00122874 * pow(temperature, 2) * percentHumidity +
-             0.00085282 * temperature*pow(percentHumidity, 2) +
-            -0.00000199 * pow(temperature, 2) * pow(percentHumidity, 2);
-
-    if((percentHumidity < 13) && (temperature >= 80.0) && (temperature <= 112.0))
-      hi -= ((13.0 - percentHumidity) * 0.25) * sqrt((17.0 - abs(temperature - 95.0)) * 0.05882);
-
-    else if((percentHumidity > 85.0) && (temperature >= 80.0) && (temperature <= 87.0))
-      hi += ((percentHumidity - 85.0) * 0.1) * ((87.0 - temperature) * 0.2);
-  }
-
-  return isCelcius ? convertFtoC(hi) : hi;
-}
-
-//------------- date and time functions
-
-/*-------- NTP code ----------*/
-
-const int NTP_PACKET_SIZE = 48; // NTP time is in the first 48 bytes of message
-byte packetBuffer[NTP_PACKET_SIZE]; //buffer to hold incoming & outgoing packets
-
-time_t getNtpTime()
-{
-  if (WiFi.isConnected()) {
-    IPAddress ntpServerIP; // NTP server's ip address
-
-    while (Udp.parsePacket() > 0) ; // discard any previously received packets
-    USE_SERIAL.println("Transmit NTP Request");
-    // get a random server from the pool
-    WiFi.hostByName(ntpServerName, ntpServerIP);
-    USE_SERIAL.print(ntpServerName);
-    USE_SERIAL.print(": ");
-    USE_SERIAL.println(ntpServerIP);
-    sendNTPpacket(ntpServerIP);
-    uint32_t beginWait = millis();
-    while (millis() - beginWait < 1500) {
-      int size = Udp.parsePacket();
-      if (size >= NTP_PACKET_SIZE) {
-        USE_SERIAL.println("NTP Response Received");
-        Udp.read(packetBuffer, NTP_PACKET_SIZE);  // read packet into the buffer
-        unsigned long secsSince1900;
-        // convert four bytes starting at location 40 to a long integer
-        secsSince1900 =  (unsigned long)packetBuffer[40] << 24;
-        secsSince1900 |= (unsigned long)packetBuffer[41] << 16;
-        secsSince1900 |= (unsigned long)packetBuffer[42] << 8;
-        secsSince1900 |= (unsigned long)packetBuffer[43];
-        return secsSince1900 - 2208988800UL + timeZone * SECS_PER_HOUR;
-      }
-    }
-    USE_SERIAL.println("No NTP Response :-(");
-  }
-  return 0; // return 0 if unable to get the time
-}
-
-// send an NTP request to the time server at the given address
-void sendNTPpacket(IPAddress &address) {
-  if (WiFi.isConnected()) {
-    // set all bytes in the buffer to 0
-    memset(packetBuffer, 0, NTP_PACKET_SIZE);
-    // Initialize values needed to form NTP request
-    // (see URL above for details on the packets)
-    packetBuffer[0] = 0b11100011;   // LI, Version, Mode
-    packetBuffer[1] = 0;     // Stratum, or type of clock
-    packetBuffer[2] = 6;     // Polling Interval
-    packetBuffer[3] = 0xEC;  // Peer Clock Precision
-    // 8 bytes of zero for Root Delay & Root Dispersion
-    packetBuffer[12] = 49;
-    packetBuffer[13] = 0x4E;
-    packetBuffer[14] = 49;
-    packetBuffer[15] = 52;
-    // all NTP fields have been given values, now
-    // you can send a packet requesting a timestamp:
-    Udp.beginPacket(address, 123); //NTP requests are to port 123
-    Udp.write(packetBuffer, NTP_PACKET_SIZE);
-    Udp.endPacket();
-  }
-}
-
-String TwoDigitNumber(int n) {
-  if (n>=0 && n<10)
+  if (n >= 0 && n < 10)
     return '0' + String(n);
   else
     return String(n);
 }
 
-String Time2Str() {
-   //return = string.format("%04d/%02d/%02d %02d:%02d:%02d", year(), month(), day(), hour(), minute(), second());
-   return String(year()) + "-" + TwoDigitNumber(month()) + "-" + TwoDigitNumber(day())+" "+TwoDigitNumber(hour())+":"+TwoDigitNumber(minute())+":" + TwoDigitNumber(second());
+String Time2Str()
+{
+  //return = string.format("%04d/%02d/%02d %02d:%02d:%02d", year(), month(), day(), hour(), minute(), second());
+  return String(year()) + "-" + TwoDigitNumber(month()) + "-" + TwoDigitNumber(day()) + " " + TwoDigitNumber(hour()) + ":" + TwoDigitNumber(minute()) + ":" + TwoDigitNumber(second());
 }
 
-String URLEncode2(const char* msg) {
-    const char *hex = "0123456789abcdef";
-    String encodedMsg = "";
+String URLEncode2(const char *msg)
+{
+  const char *hex = "0123456789abcdef";
+  String encodedMsg = "";
 
-    while (*msg!='\0'){
-        if( ('a' <= *msg && *msg <= 'z')
-                || ('A' <= *msg && *msg <= 'Z')
-                || ('0' <= *msg && *msg <= '9') ) {
-            encodedMsg += *msg;
-        } else {
-            encodedMsg += '%';
-            encodedMsg += hex[*msg >> 4];
-            encodedMsg += hex[*msg & 15];
-        }
-        msg++;
+  while (*msg != '\0')
+  {
+    if (('a' <= *msg && *msg <= 'z') || ('A' <= *msg && *msg <= 'Z') || ('0' <= *msg && *msg <= '9'))
+    {
+      encodedMsg += *msg;
     }
-    return encodedMsg;
+    else
+    {
+      encodedMsg += '%';
+      encodedMsg += hex[*msg >> 4];
+      encodedMsg += hex[*msg & 15];
+    }
+    msg++;
+  }
+  return encodedMsg;
 }
 
-String Value2String(int y){
+String Value2String(int y)
+{
   return !isnan(y) ? String(y) : "";
 }
 
-String Value2String(float y){
+String Value2String(float y)
+{
   return !isnan(y) ? String(y) : "";
 }
 
-String CreateURL(String postS) {
+String CreateURL(String postS)
+{
   String s = postS;
 
   s.replace("%ThingspeakKey", String(ThingspeakKey));
@@ -606,287 +605,254 @@ String CreateURL(String postS) {
   s.replace("%wGust", Value2String(windGust));
   s.replace("%wChill", Value2String(windChill));
   s.replace("%wDir", Value2String(windDir));
-  s.replace("%cRain", Value2String(currentRain));
-  s.replace("%hRain", Value2String(hourRain));
-  s.replace("%dRain", Value2String(dayRain));
+  s.replace("%cRain", Value2String(rainCurrent));
+  s.replace("%hRain", Value2String(rainHour));
+  s.replace("%dRain", Value2String(rainDay));
   s.replace("%now", URLEncode2(Time2Str().c_str()));
   return s;
 }
 
-void updateDateTime() {
-  USE_SERIAL.print(F("Sync clock..."));
-  Udp.begin(localPort);
-  setTime(getNtpTime());
-  USE_SERIAL.println(Time2Str());
-}
-
-void setup() {
+void setup()
+{
   // put your setup code here, to run once:
-  USE_SERIAL.begin(115200);
-  USE_SERIAL.setDebugOutput(false);
-  delay(1000);
-  USE_SERIAL.println("\n\n");
-  USE_SERIAL.println("Starting " + projectName + " version: " + currentVersion);
+  Serial.begin(115200);
+  Serial.setDebugOutput(true);
 
-  USE_SERIAL.println();
+  Serial.println("\n\n");
+  Serial.println("Starting " + projectName + " version: " + currentVersion);
 
-  //USE_SERIAL.print("FlashChipSize: ");      USE_SERIAL.println(ESP.getFlashChipSize());
-  USE_SERIAL.print(F("FlashChipRealSize: "));  USE_SERIAL.println(ESP.getFlashChipRealSize());
-  //USE_SERIAL.print("FlashChipSizeByChipId: ");  USE_SERIAL.println(ESP.getFlashChipSizeByChipId());
-  USE_SERIAL.print(F("Free Heap: "));  USE_SERIAL.println(ESP.getFreeHeap());
-  USE_SERIAL.print(F("Free Sketch Size: "));  USE_SERIAL.println(ESP.getFreeSketchSpace());
-  USE_SERIAL.print(F("Sketch Size: "));  USE_SERIAL.println(ESP.getSketchSize());
+  printBoardInfo();
 
-  USE_SERIAL.println();
   //WiFiManager
   //Local intialization. Once its business is done, there is no need to keep it around
   WiFiManager wifiManager;
   //wifiManager.setDebugOutput(false);
   //reset saved settings
   //wifiManager.resetSettings();
-  USE_SERIAL.print(F("SSID: "));
-  USE_SERIAL.println(WiFi.SSID());
-  USE_SERIAL.print(F("PASSWORD: "));
-  USE_SERIAL.println(WiFi.psk());
+  Serial.print(F("SSID: "));
+  Serial.println(WiFi.SSID());
+  Serial.print(F("PASSWORD: "));
+  Serial.println(WiFi.psk());
   //sets timeout until configuration portal gets turned off
   //useful to make it all retry or go to sleep
   //in seconds
-  wifiManager.setTimeout(180);
+  wifiManager.setConfigPortalTimeout(180);
+  wifiManager.setRemoveDuplicateAPs(false);
 
-  USE_SERIAL.println();
+  Serial.println();
 
   //fetches ssid and pass and tries to connect
   //if it does not connect it starts an access point with the specified name
   //and goes into a blocking loop awaiting configuration
-  if(!wifiManager.autoConnect(projectName.c_str())) {
-    USE_SERIAL.println(F("Failed to connect to AP and hit timeout"));
-    //reset and try again,
+  if (!wifiManager.autoConnect(projectName.c_str()))
+  {
+    Serial.println(F("Failed to connect to AP and hit timeout. Restarting now!"));
+    //restart and try again,
     ESP.restart();
     delay(1000);
   }
 
-  USE_SERIAL.println();
-  USE_SERIAL.println(F("Connected to WiFi."));
+  Serial.println();
+  Serial.println(F("Connected to WiFi."));
+  Serial.println();
 
-  USE_SERIAL.println();
-
-  // check for updates
-  updateCheck();
-
-  USE_SERIAL.println();
-
-  //udate the time
-  updateDateTime();
-
-  USE_SERIAL.println();
-
-  // ---------------- BME part -------------------
-  USE_SERIAL.print(F("Checking for BME280 Sensor... "));
-  Wire.begin(); // for BME280. Parameters are pinSDA, pinSCL Defaults are 4,5
-  // try to initialize BME280 sensor
-  if (bme.begin()) {
-    USE_SERIAL.println(F("Found!"));
-  }
-  else {
-    USE_SERIAL.println(F("Not found!"));
-  }
-  delay(1000);
-  // ----------------------------------
-  pinMode(PIN_WINDSPEED, INPUT);
-  pinMode(PIN_RAINPIN, INPUT);
+  initializeAnemometer();
+  initializeRainGauge();
+  initializeWindVane();
+  initializeBMESensor();
   pinMode(PIN_CLEAR, INPUT);
 
-  enableInterrupts();
-
-  // set updateFlag to update every
-  tickerUpdateCheck.attach(UPDATE_CHECK_INTERVAL, enableUpdateCheck);
-  //
-  tickerReadDirection.attach(READ_DIR_INTERVAL, enableReadDirection);
-  //
-  tickerClockSync.attach(CLOCK_SYNC_INTERVAL, enableClockSync);
-
-  tickerGustTimer.attach(AVERAGE_GUST_INTERVAL, enableCalcGustAverage);
-  tickerReportData.attach(REPORT_DATA_INTERVAL, enableReportData);
-
-  windSpeedStartSampleTime = millis();
-  count1h = millis();
-  count1d = millis();
+  timeClient.begin();
+  // update system clock with ntp time
+  if (timeClient.update())
+    setTime(timeClient.getEpochTime());
+  // check for FOTA
+  updateCheck();
 }
 
-// -----------------------------------------------------------------------------
-// ----------------------------- main program loop -----------------------------
-// -----------------------------------------------------------------------------
-void loop() {
+// =============================================================================
+//                             main program loop 
+// =============================================================================
+
+void loop()
+{
+  uint32_t currentMillis = millis();
 
   // if Clear button is pressed, erase ssid and restart
-  if (digitalRead(PIN_CLEAR) == LOW) {
-    USE_SERIAL.println(F("Clear wifi and restart."));
+  if (digitalRead(PIN_CLEAR) == LOW)
+  {
+    Serial.println(F("Clear wifi and restart."));
     WiFi.disconnect();
     ESP.restart();
     delay(1000);
   }
 
-  // --------- read direction every 1 sec to calculate average -------------
-  if (doReadDirection) {
-    windDir = avgWindDir(voltage2degrees(analogRead(A0)));
-    doReadDirection = false;
-    //Serial.println(ESP.getFreeHeap(), DEC);
-    //USE_SERIAL.printf("%d-%02d-%02d %02d %02d %02d\n",
-    //                  year(), month(), day(), hour(), minute(), second() );
+  // we need average gust of 3 seconds
+  // and then the max of the result over report period
+
+  // every 3 seconds sample average wind gust 
+  if ((int32_t)(currentMillis - nextWindGustTime) >= 0) 
+  {
+    nextWindGustTime = currentMillis + 3000;
+    float tmpGust = getAndResetWindGust();
+    if (tmpGust > windGust) windGust = tmpGust;
   }
 
-  float _speed = 0;
+  // 20 secs before report time, check for wind vane every second;
+  uint32_t startCheck = nextReportTime - 20000;
+  if ((int32_t)(currentMillis - startCheck) >=0 )
+  {
+    if ((int32_t)(currentMillis - nextWindVaneTime) >= 0)
+    {
+      nextWindVaneTime = currentMillis + 1000;
+      captureWindVane();
 
-  if (doCalcGustAverage) {
-    doCalcGustAverage = false;
-    if (windGustSamplesCount > 0)
-      _speed = tmpWindGust / windGustSamplesCount;
-    else
-      _speed = 0;
-    if (windGust < _speed) windGust = _speed;
-    USE_SERIAL.print("\tWindGust: "); Serial.println(_speed);
-    tmpWindGust = 0;
-    windGustSamplesCount = 0;
-  }
-
-  if (doReportData) {
-    doReportData = false;
-    USE_SERIAL.print("\tWindSamples: "); USE_SERIAL.print(windSpeedSamplesCount);
-    if (windSpeedSamplesCount > 0)
-      _speed = tmpWindSpeed / windSpeedSamplesCount;
-    else
-      _speed = 0;
-    USE_SERIAL.print("\tWindSpeed: "); Serial.println(_speed);
-    windSpeed = _speed;
-
-    windSpeedSamplesCount = 0;
-    tmpWindSpeed = 0;
-
-    disableInterrupts();
-
-    windSpeed /= 2; // we have 2 pulses / revolution   // --------<<<<<<<<<<<< don't forget this
-    windGust /= 2;
-    windPeak /= 2;
-
-    currentRain = (currentRainCount * 0.2794f); // value in mm; There are 2 pulses per change <<<< test this
-    hourRain = totalRain(currentRain);
-    dayRain += currentRain;  // not used for the moment
-
-    // ----------- read BME sensor data ------------------------
-    bme.read(pres, temp, hum, metric, pressureUnit);        // Parameters: (float& pressure, float& temp, float& humidity, bool celsius = false, uint8_t pressureUnit = 0x0)
-
-    windChill = windChillFactor(temp, windSpeed, metric);
-    dewPoint = bme.dew(temp, hum, metric);
-    heatIndex = calculateHeatIndex(temp, hum, metric);
-
-    USE_SERIAL.println();
-    USE_SERIAL.print(F("Temp: "));       USE_SERIAL.print(temp);
-    USE_SERIAL.print(F(" Hum: "));       USE_SERIAL.print(hum);
-    USE_SERIAL.print(F(" Pressure: "));  USE_SERIAL.print(pres);
-    USE_SERIAL.print(F(" Speed: "));     USE_SERIAL.print(windSpeed);
-    USE_SERIAL.print(F(" Gust: "));      USE_SERIAL.print(windGust);
-    USE_SERIAL.print(F(" Peak: "));      USE_SERIAL.print(windPeak);
-    USE_SERIAL.print(F(" Dir: "));       USE_SERIAL.print(windDir);
-    USE_SERIAL.print(F(" Current Rain: ")); USE_SERIAL.print(currentRain);
-    USE_SERIAL.print(F(" Rain/hour: ")); USE_SERIAL.print(hourRain);
-    USE_SERIAL.print(F(" Rain/day: ")); USE_SERIAL.print(dayRain);
-    USE_SERIAL.print(F(" WindChill: ")); USE_SERIAL.print(windChill);
-    USE_SERIAL.print(F(" DewPoint: "));  USE_SERIAL.print(dewPoint);
-    USE_SERIAL.print(F(" HeatIndex: ")); USE_SERIAL.println(heatIndex);
-
-
-    wakeUp();
-    restartIfNotConnected();
-
-    // ----------- update the time  ------------------
-    if (doClockSync) {
-      //udate the time
-      updateDateTime();
-      doClockSync = false;
+      Serial.println(Time2Str());
     }
+  }
+  
 
-    // ================= Create post data for thingspeak =======================
-    String postData = CreateURL(postData1);
-    USE_SERIAL.println(F("\nThingspeak post data:"));
-    USE_SERIAL.println(postData);
-    //#ifdef SENDTOSITE
-      USE_SERIAL.println(F("Sending..."));
-      send2siteSecure(postSite1, ThingspeakSHA1, postData);
-    //#endif
+	  // @@@ update system clock with ntp time
+	if (timeClient.update())
+	  setTime(timeClient.getEpochTime());
 
-    // ================= Post to my custom site ================================
-    postData = CreateURL(postData4);
-    USE_SERIAL.println(F("\nMySite post data:"));
-    USE_SERIAL.println(postData);
-    USE_SERIAL.println(F("Sending..."));
-    send2site(postSite4, postData);
+	// check for FOTA updates every UPDATE_CHECK_INTERVAL minutes;
+	if ((int32_t)(currentMillis - nextFOTACheckTime) >= 0)
+	{
+	  nextFOTACheckTime = currentMillis + UPDATE_CHECK_INTERVAL * 1000;
+	  updateCheck();
+	}
+	// @@@
+	
+  // report every REPORT_DATA_INTERVAL minutes
+  if ((int32_t)(currentMillis - nextReportTime) >= 0)
+  {
+    nextReportTime = currentMillis + REPORT_DATA_INTERVAL * 1000;
 
-    // ==========  convert metric to farenheight for wunderground ==============
-    temp = convertCtoF(temp);
-    pres = 0.0295299830714f * pres; //hPa to inches
-    windSpeed = 0.621371f * windSpeed; //mph
-    windGust = 0.621371f * windGust; //mph
-    hourRain = hourRain / 25.40f;  // rain in inches
+    //sleeping = wakeUpNow();
+    if (!sleeping) {
+      //restartIfNotConnected();
 
-    windChill = windChillFactor(temp, windSpeed, false);
-    dewPoint = bme.dew(temp, hum, false);
-    heatIndex = calculateHeatIndex(temp, hum, false);
+            // moved @@@ here because is waked up and we need internet connection
 
-    // ------------------------- post to wunderground --------------------------
-    postData = CreateURL(postData2);
-    USE_SERIAL.println("\nWUnderground post data:");
-    USE_SERIAL.println(postData);
-    #ifdef SENDTOSITE
-      USE_SERIAL.println(F("Sending..."));
+			// @@@
+
+
+      // ----------- read BME sensor data ------------------------
+      if (BMESensorFound )
+      {
+        BME280::TempUnit tempUnit(BME280::TempUnit_Celsius);
+        BME280::PresUnit presUnit(BME280::PresUnit_hPa);
+        bme.read(pres, temp, hum, tempUnit, presUnit); // Parameters: (float& pressure, float& temp, float& humidity, bool celsius = false, uint8_t pressureUnit = 0x0)
+        windChill = windChillFactor(temp, windSpeed, metric);
+        dewPoint = EnvironmentCalculations::DewPoint(temp, hum, EnvironmentCalculations::TempUnit_Celsius);
+        heatIndex = calculateHeatIndex(temp, hum, metric);
+      }
+
+      // read wind and rain data
+      rainCurrent = getAndResetRainInches() * 25.4f;     // rain in mm
+      windSpeed = getAndResetAnemometerMPH();
+
+      windSpeed *= 1.609344f;  // convert to km/h
+      windGust *= 1.609344f;
+      windPeak *= 1.609344f;
+      windDir = getAndResetWindVaneDegrees();
+
+  //    disableInterrupts();
+
+      Serial.println();
+      Serial.print(F("Temp: "));
+      Serial.print(temp);
+      Serial.print(F(" Hum: "));
+      Serial.print(hum);
+      Serial.print(F(" Pressure: "));
+      Serial.print(pres);
+      Serial.print(F(" Speed: "));
+      Serial.print(windSpeed);
+      Serial.print(F(" Gust: "));
+      Serial.print(windGust);
+      Serial.print(F(" Peak: "));
+      Serial.print(windPeak);
+      Serial.print(F(" Dir: "));
+      Serial.print(windDir);
+      Serial.print(F(" Current Rain: "));
+      Serial.print(rainCurrent);
+      Serial.print(F(" Rain/hour: "));
+      Serial.print(rainHour);
+      Serial.print(F(" Rain/day: "));
+      Serial.print(rainDay);
+      Serial.print(F(" WindChill: "));
+      Serial.print(windChill);
+      Serial.print(F(" DewPoint: "));
+      Serial.print(dewPoint);
+      Serial.print(F(" HeatIndex: "));
+      Serial.println(heatIndex);
+
+
+      // ================= Create post data for thingspeak =======================
+      String postData = CreateURL(postData1);
+      Serial.println(F("\nThingspeak post data:"));
+      Serial.println(postData);
+      //#ifdef SENDTOSITE
+      Serial.println(F("Sending..."));
+      //send2siteSecure(postSite1, ThingspeakSHA1, postData);
+      send2site(postSite1, postData);
+      //#endif
+
+      // ================= Post to my custom site ================================
+      postData = CreateURL(postData4);
+      Serial.println(F("\nMySite post data:"));
+      Serial.println(postData);
+      Serial.println(F("Sending..."));
+      send2site(postSite4, postData);
+
+      // ==========  convert metric to farenheight for wunderground ==============
+      temp = convertCtoF(temp);
+      pres = 0.0295299830714f * pres;    //hPa to inches
+      windSpeed = 0.621371f * windSpeed; //mph
+      windGust = 0.621371f * windGust;   //mph
+      rainHour /= 25.40f;      // rain in inches
+
+      windChill = windChillFactor(temp, windSpeed, false);
+      dewPoint = EnvironmentCalculations::DewPoint(temp, hum, EnvironmentCalculations::TempUnit_Fahrenheit);
+      heatIndex = calculateHeatIndex(temp, hum, false);
+
+      // ------------------------- post to wunderground --------------------------
+      postData = CreateURL(postData2);
+      Serial.println("\nWUnderground post data:");
+      Serial.println(postData);
+  #ifdef SENDTOSITE
+      Serial.println(F("Sending..."));
       send2siteSecure(postSite2, WUndergroundSHA1, postData);
-    #endif
+  #endif
 
-    // ------------------------- post to PWSweather.com --------------------------
-    postData = CreateURL(postData3);
-    USE_SERIAL.println("\nPWSweather.com post data:");
-    USE_SERIAL.println(postData);
-    #ifdef SENDTOSITE
-      USE_SERIAL.println(F("Sending..."));
+      // ------------------------- post to PWSweather.com --------------------------
+      postData = CreateURL(postData3);
+      Serial.println("\nPWSweather.com post data:");
+      Serial.println(postData);
+  #ifdef SENDTOSITE
+      Serial.println(F("Sending..."));
       send2siteSecure(postSite3, PWSweatherSHA1, postData);
-    #endif
+  #endif
 
-    // -------------------- check for firmware updates FOTA --------------------
-    if (doUpdateCheck) {
-      updateCheck();
-      doUpdateCheck = false;
+      windPeak = 0.0f;
+      windGust = 0.0f;
+      
+      //sleepNow();
+      //enableInterrupts();
     }
-
-    // ==================== turn off wifi to save battery  =====================
-    USE_SERIAL.print(F("Entering wifi sleep... "));
-    WiFi.forceSleepBegin();
-    delay(1000);
-    USE_SERIAL.println("ok!");
-
-    windSpeed = 0.0f;
-    windSpeedSamplesCount = 0;
-
-    windGust = 0.0f;
-    windGustSamplesCount = 0;
-
-    windPeak = 0.0f;
-    windSpeedLastIntTime = 0;
-    currentRainCount = 0;
-    enableInterrupts();
+    
   }
 
-  // do this every hour:
-  /*
-  if (((millis() - count1h) >= 3600000) && (hourRainCount > 0)) {
-    hourRain = 0.0f;
-    hourRainCount = 0;
-    count1h = millis();
-  }
-  */
-
-  // do this every day:
-  if (((millis() - count1d) >= (3600000*24)) && (dayRainCount > 0)) {
-    dayRain = 0.0f;
-    dayRainCount = 0;
-    count1d = millis();
-  }
+  yield();
 }
+
+/* todo: check this out: 
+https://github.com/fractalxaos/weather/blob/master/Arduino/WeatherStation.ino
+https://github.com/rpurser47/weatherstation/blob/master/weatherstation.ino
+https://github.com/sparkfun/Wimp_Weather_Station/blob/master/Wimp_Weather_Station.ino
+https://github.com/PaulRB/Wemos-Weather-Station
+http://mile-end.co.uk/blog/?p=86
+http://www.iwmi.cgiar.org/tools/mobile-weather-stations/Mobile%20Weather%20Stations%20-%20Manual.pdf
+https://www.hackster.io/hliang/thingspeak-weather-station-data-analysis-2877b0
+*/

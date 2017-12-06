@@ -3,5 +3,8 @@
 .gcc-flags.json
 .piolibdeps
 lib/
+info/
 platformio.ini
 src/Accounts.h
+.vscode/c_cpp_properties.json
+debug.log
