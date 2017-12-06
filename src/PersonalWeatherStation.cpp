@@ -4,6 +4,7 @@
 #include <DNSServer.h>
 #include <ESP8266WebServer.h>
 #include <WiFiManager.h>
+#include <WiFiClientSecure.h>
 #include <ESP8266HTTPClient.h>
 #include <ESP8266httpUpdate.h>
 #include <TimeLib.h>
@@ -18,6 +19,7 @@
 #define UPDATE_CHECK_INTERVAL 300 // FOTA update interval
 #define AVERAGE_GUST_INTERVAL 3   // calc average gust every 3 seconds and uses the max of these measurements. https://www.wmo-sat.info/oscar/variables/view/205
 #define REPORT_DATA_INTERVAL 600  // report every X seconds
+#define REPORT_TIMES_PER_HOUR 6   //
 #define CUP_CIRCUMFERENCE 1       // in meters. Experiment with this value (0.67 * 1.5)
 #define READ_DIR_INTERVAL 1       // read wind direction sensor every 1 sec to calc average
 #define CLOCK_SYNC_INTERVAL 3600  // update clock every X seconds
@@ -25,18 +27,32 @@
 #define DEBOUNCE_DELAY 10         // 10 ms
 
 String projectName = "anemometer";
-String currentVersion = "1.0.17";
+String currentVersion = "1.0.23";
 #define SENDTOSITE // if commented, will not post to sites.
 
+const int httpsPort = 443;
+const int httpPort = 80;
+
 //thingspeak
-String postSite1 = "http://api.thingspeak.com/update";
-String postData1 = "key=%ThingspeakKey&field1=%temp&field2=%hum&field3=%pres&field4=%dew&field5=%heatIdx&field6=%wSpeed&field7=%wGust&field8=%wDir";
+const char* postSite1 = "api.thingspeak.com";
+String postData1 = "/update?key=%ThingspeakKey&field1=%temp&field2=%hum&field3=%pres&field4=%dew&field5=%heatIdx&field6=%wSpeed&field7=%wGust&field8=%wDir";
+const char* ThingspeakSHA1 = "78:60:18:44:81:35:BF:DF:77:84:D4:0A:22:0D:9B:4E:6C:DC:57:2C";
+
 // weatherundergound
-String postSite2 = "http://weatherstation.wunderground.com/weatherstation/updateweatherstation.php";
-String postData2 = "ID=%WUndergroundID&PASSWORD=%WUndergroundPSW&dateutc=now&winddir=%wDir&windspeedmph=%wSpeed&windgustmph=%wGust&tempf=%temp&baromin=%pres&dewptf=%dew&humidity=%hum&rainin=%hRain&softwaretype=esp8266&action=updateraw";
+const char* postSite2 = "weatherstation.wunderground.com";
+String postData2 = "/weatherstation/updateweatherstation.php?ID=%WUndergroundID&PASSWORD=%WUndergroundPSW&dateutc=now&winddir=%wDir&windspeedmph=%wSpeed&windgustmph=%wGust&tempf=%temp&baromin=%pres&dewptf=%dew&humidity=%hum&rainin=%hRain&softwaretype=esp8266&action=updateraw";
+const char* WUndergroundSHA1 = "12:DB:BB:24:8E:0F:6F:D4:63:EC:45:DD:5B:ED:37:D7:6F:B1:5F:E5";
+
 //PWSweather.com
-String postSite3 = "http://www.pwsweather.com/pwsupdate/pwsupdate.php";
-String postData3 = "ID=%PWSweatherID&PASSWORD=%PWSweatherPSW&dateutc=%now&winddir=%wDir&windspeedmph=%wSpeed&windgustmph=%wGust&tempf=%temp&baromin=%pres&dewptf=%dew&humidity=%hum&rainin=%hRain&softwaretype=esp8266&action=updateraw";
+const char* postSite3 = "www.pwsweather.com";
+String postData3 = "/pwsupdate/pwsupdate.php?ID=%PWSweatherID&PASSWORD=%PWSweatherPSW&dateutc=%now&winddir=%wDir&windspeedmph=%wSpeed&windgustmph=%wGust&tempf=%temp&baromin=%pres&dewptf=%dew&humidity=%hum&rainin=%hRain&softwaretype=esp8266&action=updateraw";
+const char* PWSweatherSHA1 = "74:3C:4F:DD:3E:8E:51:40:B4:28:79:7D:6A:B4:30:FE:4A:56:10:BE";
+
+const char* postSite4 = "www.studio19.gr";
+String postData4 = "/weather/post.php?id=%MySiteID&psw=%MySitePSW&temp=%temp&hum=%hum&pressure=%pres&heatindex=%heatIdx&dewpoint=%dew&windspeed=%wSpeed&windgust=%wGust&winddir=%wDir&windchill=%wChill&rain=%hRain&dayrain=%dRain";
+//const char* postSite4 = "139.91.162.84";
+// String postData4 = "/html/ws/post.php?id=%MySiteID&psw=%MySitePSW&temp=%temp&hum=%hum&pressure=%pres&heatindex=%heatIdx&dewpoint=%dew&windspeed=%wSpeed&windgust=%wGust&winddir=%wDir&windchill=%wChill&rain=%hRain&dayrain=%dRain";
+
 
 // variables for ntp time
 static const char ntpServerName[] = "pool.ntp.org";
@@ -83,9 +99,9 @@ unsigned long windSpeedStartSampleTime = 0;
 unsigned int periodsCount = 0;
 
 int windDir = 0;
-float dewPoint = 0.0f;
-float heatIndex = 0.0f;
-float windChill = 0.0f;
+float dewPoint = NAN;
+float heatIndex = NAN;
+float windChill = NAN;
 
 volatile int currentRainCount = 0;
 float currentRain = 0.0f;
@@ -137,11 +153,80 @@ void restartIfNotConnected() {
     delay(1000);
     }
 }
+// check http://stackoverflow.com/questions/41371156/esp8266-and-post-request
 
-void send2site(String site, String data) {
+void send2site(const char* host, String data) {
+
+  WiFiClient client;
+  USE_SERIAL.print("connecting to ");
+  USE_SERIAL.println(host);
+  if (!client.connect(host, httpPort)) {
+    USE_SERIAL.println("connection failed");
+    return;
+  }
+
+  USE_SERIAL.print("requesting URL: ");
+  USE_SERIAL.println(data);
+
+  client.print(String("GET ") + data + " HTTP/1.1\r\n" +
+               "Host: " + host + "\r\n" +
+               "User-Agent: ESP8266\r\n" +
+               "Connection: close\r\n\r\n");
+
+  USE_SERIAL.println("request sent");
+
+	delay(10);
+
+	while (client.connected()) {
+    String line = client.readStringUntil('\n');
+		line += ("\r\n");
+		USE_SERIAL.print(line);
+  }
+  USE_SERIAL.println("closing connection");
+}
+
+void send2siteSecure(const char* host, const char* fingerprint, String data) {
+
+// Use WiFiClientSecure class to create TLS connection
+  WiFiClientSecure client;
+  USE_SERIAL.print("connecting to ");
+  USE_SERIAL.println(host);
+  if (!client.connect(host, httpsPort)) {
+    USE_SERIAL.println("connection failed");
+    return;
+  }
+
+  if (client.verify(fingerprint, host)) {
+    USE_SERIAL.println("certificate matches");
+  } else {
+    USE_SERIAL.println("certificate doesn't match");
+  }
+
+  USE_SERIAL.print("requesting URL: ");
+  USE_SERIAL.println(data);
+
+  client.print(String("GET ") + data + " HTTP/1.1\r\n" +
+               "Host: " + host + "\r\n" +
+               "User-Agent: ESP8266\r\n" +
+               "Connection: close\r\n\r\n");
+
+  USE_SERIAL.println("request sent");
+
+	delay(10);
+
+	while (client.connected()) {
+    String line = client.readStringUntil('\n');
+		line += ("\r\n");
+		USE_SERIAL.print(line);
+  }
+  USE_SERIAL.println("closing connection");
+}
+
+/*
+void send2site(String site, String fingerprint, String data) {
   if (WiFi.isConnected()) {
 	  HTTPClient http;
-	  http.begin(site);
+	  http.begin(site, fingerprint);
 	  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
 	  int httpCode = http.POST(data);
 	  // httpCode will be negative on error
@@ -161,6 +246,7 @@ void send2site(String site, String data) {
 	  http.end();
   }
 }
+*/
 
 void windSpeedPinInterrupt() {
   if (windSpeedLastIntTime == 0){
@@ -194,13 +280,13 @@ void rainPinInterrupt() {
 }
 
 float totalRain(float rainValue) {
-  static float rainValues[REPORT_DATA_INTERVAL] = {};
+  static float rainValues[REPORT_TIMES_PER_HOUR] = {};
   float total = 0;
-  for (int i = 0; i < REPORT_DATA_INTERVAL-1; i++) {
+  for (int i = 0; i < REPORT_TIMES_PER_HOUR-1; i++) {
     rainValues[i] = rainValues[i+1];
     total += rainValues[i];
   }
-  rainValues[REPORT_DATA_INTERVAL-1]=rainValue;
+  rainValues[REPORT_TIMES_PER_HOUR-1]=rainValue;
   total += rainValue;
   return total;
 }
@@ -347,18 +433,20 @@ int avgWindDir(int windDirection)
 }
 
 float windChillFactor(float _temperature, float _windspeed, bool isCelcius){
-  float _windChill =0.0f;
-  if (isCelcius) {
-    if ( (_temperature <= 10.0f) && (_windspeed > 4.8f) ) {    //celcius & km/h
-      _windChill = 13.12f + 0.6215f * _temperature -
-                   11.37f * pow(_windspeed, 0.16f) +
-                  0.3965f * _temperature * pow(_windspeed, 0.16f);
+  float _windChill = NAN;
+  if (!isnan(_temperature)) {
+    if (isCelcius) {
+      if ( (_temperature <= 10.0f) && (_windspeed > 4.8f) ) {    //celcius & km/h
+        _windChill = 13.12f + 0.6215f * _temperature -
+                     11.37f * pow(_windspeed, 0.16f) +
+                    0.3965f * _temperature * pow(_windspeed, 0.16f);
+      }
     }
-  }
-  else if ((_temperature <= 50.0f) && (_windspeed > 3.0f)) {     // fahrenheit & miles/h
-    _windChill = 35.74f + 0.6215f * _temperature -
-                 35.75f * pow(_windspeed, 0.16f) +
-                0.4275f * _temperature * pow(_windspeed, 0.16f);
+    else if ((_temperature <= 50.0f) && (_windspeed > 3.0f)) {     // fahrenheit & miles/h
+      _windChill = 35.74f + 0.6215f * _temperature -
+                   35.75f * pow(_windspeed, 0.16f) +
+                  0.4275f * _temperature * pow(_windspeed, 0.16f);
+    }
   }
   return _windChill;
 }
@@ -366,6 +454,7 @@ float windChillFactor(float _temperature, float _windspeed, bool isCelcius){
 float calculateHeatIndex(float temperature, float percentHumidity, bool isCelcius) {
   // Using both Rothfusz and Steadman's equations
   // http://www.wpc.ncep.noaa.gov/html/heatindex_equation.shtml
+  if (isnan(temperature) || isnan(percentHumidity)) return NAN;
   float hi;
 
   if (isCelcius)
@@ -458,9 +547,16 @@ void sendNTPpacket(IPAddress &address) {
   }
 }
 
+String TwoDigitNumber(int n) {
+  if (n>=0 && n<10)
+    return '0' + String(n);
+  else
+    return String(n);
+}
+
 String Time2Str() {
    //return = string.format("%04d/%02d/%02d %02d:%02d:%02d", year(), month(), day(), hour(), minute(), second());
-   return String(year()) + "-" + String(month()) + "-" + String(day())+" "+String(hour())+":"+String(minute())+":" + String(second());
+   return String(year()) + "-" + TwoDigitNumber(month()) + "-" + TwoDigitNumber(day())+" "+TwoDigitNumber(hour())+":"+TwoDigitNumber(minute())+":" + TwoDigitNumber(second());
 }
 
 String URLEncode2(const char* msg) {
@@ -482,6 +578,14 @@ String URLEncode2(const char* msg) {
     return encodedMsg;
 }
 
+String Value2String(int y){
+  return !isnan(y) ? String(y) : "";
+}
+
+String Value2String(float y){
+  return !isnan(y) ? String(y) : "";
+}
+
 String CreateURL(String postS) {
   String s = postS;
 
@@ -490,18 +594,21 @@ String CreateURL(String postS) {
   s.replace("%WUndergroundPSW", String(WUndergroundPSW));
   s.replace("%PWSweatherID", String(PWSweatherID));
   s.replace("%PWSweatherPSW", String(PWSweatherPSW));
+  s.replace("%MySiteID", String(MySiteID));
+  s.replace("%MySitePSW", String(MySitePSW));
 
-  s.replace("%temp", String(temp));
-  s.replace("%hum", String(hum));
-  s.replace("%pres", String(pres));
-  s.replace("%dew", String(dewPoint));
-  s.replace("%heatIdx", String(heatIndex));
-  s.replace("%wSpeed", String(windSpeed));
-  s.replace("%wGust", String(windGust));
-  s.replace("%wDir", String(windDir));
-  s.replace("%cRain", String(currentRain));
-  s.replace("%hRain", String(hourRain));
-  s.replace("%dRain", String(dayRain));
+  s.replace("%temp", Value2String(temp));
+  s.replace("%hum", Value2String(hum));
+  s.replace("%pres", Value2String(pres));
+  s.replace("%dew", Value2String(dewPoint));
+  s.replace("%heatIdx", Value2String(heatIndex));
+  s.replace("%wSpeed", Value2String(windSpeed));
+  s.replace("%wGust", Value2String(windGust));
+  s.replace("%wChill", Value2String(windChill));
+  s.replace("%wDir", Value2String(windDir));
+  s.replace("%cRain", Value2String(currentRain));
+  s.replace("%hRain", Value2String(hourRain));
+  s.replace("%dRain", Value2String(dayRain));
   s.replace("%now", URLEncode2(Time2Str().c_str()));
   return s;
 }
@@ -704,8 +811,15 @@ void loop() {
     USE_SERIAL.println(postData);
     //#ifdef SENDTOSITE
       USE_SERIAL.println(F("Sending..."));
-      send2site(postSite1, postData);
+      send2siteSecure(postSite1, ThingspeakSHA1, postData);
     //#endif
+
+    // ================= Post to my custom site ================================
+    postData = CreateURL(postData4);
+    USE_SERIAL.println(F("\nMySite post data:"));
+    USE_SERIAL.println(postData);
+    USE_SERIAL.println(F("Sending..."));
+    send2site(postSite4, postData);
 
     // ==========  convert metric to farenheight for wunderground ==============
     temp = convertCtoF(temp);
@@ -724,7 +838,7 @@ void loop() {
     USE_SERIAL.println(postData);
     #ifdef SENDTOSITE
       USE_SERIAL.println(F("Sending..."));
-      send2site(postSite2, postData);
+      send2siteSecure(postSite2, WUndergroundSHA1, postData);
     #endif
 
     // ------------------------- post to PWSweather.com --------------------------
@@ -733,7 +847,7 @@ void loop() {
     USE_SERIAL.println(postData);
     #ifdef SENDTOSITE
       USE_SERIAL.println(F("Sending..."));
-      send2site(postSite3, postData);
+      send2siteSecure(postSite3, PWSweatherSHA1, postData);
     #endif
 
     // -------------------- check for firmware updates FOTA --------------------
